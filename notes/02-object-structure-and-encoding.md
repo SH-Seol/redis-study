@@ -265,6 +265,28 @@ struct __attribute__ ((__packed__)) sdshdr64 {
 이 안에 `len`은 길이 정보, `alloc`은 헤더와 널 종료 문자를 제외한 실제 할당된 메모리 바이트 수,
 `flags`는 SDS의 타입 정보를 저장하는 1바이트 필드, `buf[]`실제 문자열 데이터가 저장되는 배열입니다.
 
+#### (1) 구조체가 왜 `__attribute__((__packed__))`일까요?
+
+C 구조체는 기본적으로 정렬(alignment)를 맞추기 위해 중간에 패딩 바이트를 삽입합니다.
+그런데 Redis는 메모리를 한 바이트라도 아끼고자 하기 때문에 패딩이 없이 필드가 연속된 메모리로 붙어 있어야 합니다.
+
+#### (2) 왜 len, alloc이 둘 다 존재할까요?
+
+C 문자열의 단점, 확장 비용과 O(n)의 길이 계산을 해결하기 위해 존재합니다.
+len은 현재 문자열 길이를 O(1)로 정보를 얻기 위해 있습니다. 
+만약 len이 없다면 `strlen()`처럼 전체 탐색을 해야 합니다.
+
+alloc은 buf에 할당된 전체 용량을 나타냅니다. 확장 시 재할당 여부를 판단하기 위해 필요한 것이죠.
+남은 공간은 alloc - len 입니다. 
+alloc이 없다면 append 할 때마다 매번 realloc해야하고, preallocation(2배 증가)을 할 수 없습니다.
+또한 out-of-bounds 위험이 증가하게 됩니다.
+
+즉 읽기(len), 쓰기(alloc) 성능 둘 다 확보하기 위해 두 필드를 분리한 것입니다.
+
+#### (3) header 크기가 메모리 효율에 어떤 영향을 줄까요?
+헤더가 커지면 작은 문자열에서도 메모리를 폭발적으로 낭비할 수 있습니다.
+Redis의 헤더 크기가 전체 메모리 사용량에 직접적으로 영향을 줄 수 있습니다.
+
 ---
 
 ### 생성 과정
@@ -293,6 +315,22 @@ sds _sdsnewlen(const void *init, size_t initlen, int trymalloc) {
 ```
 `char type = sdsReqType(initlen);`타입을 먼저 파악을 합니다. HDR5, 8, 16, 32, 64 무엇인지 먼저 파악하고,
 만약 TYPE이 5이면 나중에 append와 같은 과정에서 호환을 위해 8로 수정합니다.
+
+다음은 sdsReqType입니다.
+```c
+char sdsReqType(size_t string_size) {
+    if (string_size < 1 << 5) return SDS_TYPE_5;
+    if (string_size <= (1 << 8) - sizeof(struct sdshdr8) - 1) return SDS_TYPE_8;
+    if (string_size <= (1 << 16) - sizeof(struct sdshdr16) - 1) return SDS_TYPE_16;
+#if (LONG_MAX == LLONG_MAX)
+    if (string_size <= (1ll << 32) - sizeof(struct sdshdr32) - 1) return SDS_TYPE_32;
+    return SDS_TYPE_64;
+#else
+    return SDS_TYPE_32;
+#endif
+}
+```
+
 ```c
 sh = trymalloc?
         s_trymalloc_usable(hdrlen+initlen+1, &bufsize) :
